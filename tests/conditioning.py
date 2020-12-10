@@ -38,6 +38,14 @@ conv_outp = OutputNode(conv, name='output')
 test_net = ReversibleGraphNet([inp, c1, conv, flatten, c2, c3, linear, outp])
 
 
+def multiply_all(container):
+
+    value = container[0]
+    for i in range(1, len(container)):
+        value *= container[i]
+
+    return value
+
 class ConditioningTest(unittest.TestCase):
 
     def __init__(self, *args):
@@ -127,6 +135,85 @@ class ConditioningTest(unittest.TestCase):
         obs = torch.max(torch.abs(x - x_re))
         self.assertTrue(obs < self.tol, f"{obs} !< {self.tol}")
         test_net.to('cpu')
+
+#taken from https://github.com/VLL-HD/conditional_INNs/blob/master/mnist_minimal_example/model.py
+class MNISTMinimalTest(unittest.TestCase):
+
+    def __init__(self, *args):
+        super().__init__(*args)
+
+        self.numel = 128
+        self.batch_size = 8
+        self.inp_size = (1, 28, 28)
+        self.tol = 1e-3
+
+        torch.manual_seed(self.numel)
+
+        #training data to emulate MNIST
+        self.x = torch.randn(self.numel, *self.inp_size).to(DEVICE)
+        self.cond_size = (10,)
+        self.c1 = torch.zeros(size=(self.numel, *self.cond_size)).to(DEVICE)
+
+        for i in range(self.numel):
+            val = i % 10
+            self.x[i,...] += 10.*float(i)
+            self.c1[i,...] = float(i) #might be that this should be one-hot encoded
+
+        
+
+        def subnet(ch_in, ch_out):
+            return nn.Sequential(nn.Linear(ch_in, 512),
+                                 nn.ReLU(),
+                                 nn.Linear(512, ch_out))
+
+        cond = ConditionNode(*self.cond_size, name="MNIST::cond")
+        nodes = [InputNode(*self.inp_size, name="MNIST::input")]
+        nodes.append(Node(nodes[-1], Flatten, {}, name="MNIST::flatten"))
+
+        nodes.append(Node(nodes[-1], PermuteRandom , {'seed':self.numel}, name="MNIST::permute"))
+        nodes.append(Node(nodes[-1], GLOWCouplingBlock,
+                             {'subnet_constructor':subnet, 'clamp':1.0},
+                             conditions=cond,name="MNIST::glow" ))
+
+        self.net = ReversibleGraphNet(nodes + [cond, OutputNode(nodes[-1],name="MNIST::output")], verbose=False).to(DEVICE)
+
+    def test_on_any(self):
+        #a single batch
+        xbatch = self.x[:self.batch_size,...]
+        c1batch = self.c1[:self.batch_size,...]
+        self.assertTrue(len(xbatch.shape) == len(self.x.shape), f"{xbatch.shape,self.x.shape}")
+        self.assertTrue(len(c1batch.shape) == len(self.c1.shape), f"{c1batch.shape,self.c1.shape}")
+        #check if broadcasting works
+        self.assertTrue(len(xbatch.shape) == 4, f"{xbatch.shape}")
+        self.assertTrue(len(c1batch.shape) == 2, f"{c1batch.shape}")
+
+        #run fwd and bwd
+        y = self.net(xbatch, c=[c1batch])
+        x_re = self.net(y, c=[c1batch], rev=True)
+
+        self.assertTrue(multiply_all(xbatch.shape) == multiply_all(y.shape), f"{xbatch.shape,y.shape}")
+
+        #check roundtrip
+        obs = torch.max(torch.abs(xbatch - x_re))
+        self.assertTrue(obs < self.tol, f"{obs} !< {self.tol}")
+        test_net.to('cpu')
+
+    def test_jacobian(self):
+        #a single batch
+        xbatch = self.x[:self.batch_size,...]
+        c1batch = self.c1[:self.batch_size,...]
+
+        # Compute log det of Jacobian on batch
+        y = self.net(xbatch, c=c1batch).to(DEVICE)
+
+        logdet = self.net.log_jacobian( xbatch, c=c1batch ).to(DEVICE)
+        # Approximate log det of Jacobian numerically
+        # TODO: always throws an error on the shape of the condition
+        logdet_num = test_net.log_jacobian_numerical( xbatch, c=c1batch ).to(DEVICE)
+        # Check that they are the same (within tolerance)
+        obs = torch.allclose(logdet, logdet_num, atol=0.01, rtol=0.01)
+        self.assertTrue(obs, f"batch: {logdet, logdet_num}")
+
 
 
 if __name__ == '__main__':
